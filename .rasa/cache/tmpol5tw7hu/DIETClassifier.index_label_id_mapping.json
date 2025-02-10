@@ -1,0 +1,12 @@
+{
+  "0": "add_expense",
+  "1": "affirm",
+  "2": "bot_challenge",
+  "3": "confirm_whatsapp",
+  "4": "deny",
+  "5": "goodbye",
+  "6": "greet",
+  "7": "mood_great",
+  "8": "mood_unhappy",
+  "9": "query_expense"
+}

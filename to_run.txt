@@ -1,0 +1,19 @@
+--> credentials.yml was changed
+
+rasa run --enable-api --cors "*" --debug
+rasa run actions
+ngrok http 5005
+
+
+// iske baad forwarding samor link copy paste in twilio upto app
+
+
+
+// train new
+rasa train
+then top stuff
+
+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
+
+
+use rasa shell for local testing 

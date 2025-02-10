@@ -1,0 +1,156 @@
+from typing import Any, Text, Dict, List
+import sqlite3
+import datetime
+from rasa_sdk import Action, Tracker
+from rasa_sdk.executor import CollectingDispatcher
+import re
+
+DATABASE = 'expenses.db'
+
+def init_db():
+    """Initialize the SQLite database and create the 'expenses' table if it doesn't exist."""
+    try:
+        conn = sqlite3.connect(DATABASE)
+        c = conn.cursor()
+        create_table_query = """
+            CREATE TABLE IF NOT EXISTS expenses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                description TEXT,
+                amount REAL,
+                category TEXT,
+                date TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+        """
+        c.execute(create_table_query)
+        conn.commit()
+    except Exception as e:
+        print("Error initializing database:", e)
+    finally:
+        conn.close()
+
+# Initialize the database when the actions server starts.
+init_db()
+
+class ActionAddExpense(Action):
+    def name(self) -> Text:
+        return "action_add_expense"
+    
+    def run(self, dispatcher: CollectingDispatcher,
+            tracker: Tracker,
+            domain: Dict[Text, Any]) -> List[Dict[Text, Any]]:
+        print("ActionAddExpense is being called.")
+        message = tracker.latest_message.get('text')
+        amount = None
+        # Try to extract the amount using entities first.
+        for ent in tracker.latest_message.get('entities'):
+            if ent.get('entity') == 'amount':
+                try:
+                    amount = float(ent.get('value'))
+                except Exception:
+                    amount = None
+        # Fallback: use regex extraction if no entity is found.
+        if amount is None:
+            import re
+            pattern = r"[₹$]?([0-9]+(?:\.[0-9]{1,2})?)"
+            match = re.search(pattern, message)
+            if match:
+                amount = float(match.group(1))
+        
+        if not amount:
+            dispatcher.utter_message(text="I could not detect an expense amount. Please include an amount.")
+            return []
+        
+        # Updated categorization logic:
+        msg = message.lower()
+        if "swiggy" in msg or "blinkit" in msg or "online food" in msg:
+            category = "online_food"
+        elif "starbucks" in msg or "cappuccino" in msg or "coffee" in msg:
+            # Make sure this rule doesn't accidentally catch online orders if you prefer them to be separate.
+            category = "coffee"
+        elif "ola" in msg or "uber" in msg or "train" in msg:
+            category = "travel"
+        elif "cake" in msg or "dinner" in msg or "snacks" in msg:
+            category = "food"
+        else:
+            category = "others"
+        
+        # Use today's date (you can extend to extract dates later)
+        date_str = datetime.date.today().isoformat()
+        
+        try:
+            conn = sqlite3.connect(DATABASE)
+            c = conn.cursor()
+            insert_query = "INSERT INTO expenses (description, amount, category, date) VALUES (?, ?, ?, ?)"
+            c.execute(insert_query, (message, amount, category, date_str))
+            conn.commit()
+        except Exception as e:
+            dispatcher.utter_message(text="There was an error recording your expense.")
+            print("SQLite Error:", e)
+            return []
+        finally:
+            conn.close()
+        
+        dispatcher.utter_message(text="Your expense has been recorded.")
+        return []
+
+
+class ActionQueryExpense(Action):
+    def name(self) -> Text:
+        return "action_query_expense"
+    
+    def run(self, dispatcher: CollectingDispatcher,
+            tracker: Tracker,
+            domain: Dict[Text, Any]) -> List[Dict[Text, Any]]:
+        query_text = tracker.latest_message.get('text').lower()
+        category = None
+        # Updated query categorization:
+        if "online" in query_text or "swiggy" in query_text or "blinkit" in query_text:
+            category = "online_food"
+        elif "lunch" in query_text or "food" in query_text:
+            category = "food"
+        elif "coffee" in query_text or "starbucks" in query_text:
+            category = "coffee"
+        elif "travel" in query_text or "ola" in query_text or "uber" in query_text or "train" in query_text:
+            category = "travel"
+        
+        try:
+            conn = sqlite3.connect(DATABASE)
+            c = conn.cursor()
+            if category:
+                query = "SELECT description, amount, date FROM expenses WHERE category = ?"
+                c.execute(query, (category,))
+            else:
+                query = "SELECT description, amount, date FROM expenses"
+                c.execute(query)
+            rows = c.fetchall()
+        except Exception as e:
+            dispatcher.utter_message(text="There was an error retrieving your expenses.")
+            print("SQLite Error:", e)
+            return []
+        finally:
+            conn.close()
+        
+        if rows:
+            total = sum(row[1] for row in rows)
+            response = ""
+            if category:
+                if category == "online_food":
+                    response += f"Your total spending on online food orders is ₹{total}:\n"
+                elif category == "coffee":
+                    response += f"Your total coffee expenditure is ₹{total}:\n"
+                elif category == "food":
+                    response += f"Your total food expenditure is ₹{total}:\n"
+                elif category == "travel":
+                    response += f"Your total travel expenditure is ₹{total}:\n"
+                else:
+                    response += f"Your total expenditure on {category} is ₹{total}:\n"
+            else:
+                response += f"Your total expenses are ₹{total}.\n"
+            for row in rows:
+                response += f"- {row[0]}: ₹{row[1]} on {row[2]}\n"
+        else:
+            response = "No expenses found."
+        
+        dispatcher.utter_message(text=response)
+        return []

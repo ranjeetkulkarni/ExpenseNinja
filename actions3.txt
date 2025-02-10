@@ -1,0 +1,224 @@
+from typing import Any, Text, Dict, List
+import sqlite3
+import datetime
+import re
+import logging
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from rasa_sdk import Action, Tracker
+from rasa_sdk.executor import CollectingDispatcher
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s",
+    handlers=[logging.FileHandler("expense_tracker.log"), logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+
+DATABASE = 'expenses.db'
+
+def init_db():
+    """Initialize the database with expenses table."""
+    try:
+        with sqlite3.connect(DATABASE) as conn:
+            c = conn.cursor()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS expenses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    description TEXT,
+                    amount REAL,
+                    base_category TEXT,
+                    date TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            c.execute("CREATE INDEX IF NOT EXISTS idx_category ON expenses (base_category)")
+            conn.commit()
+    except Exception as e:
+        logger.exception("Database init error: %s", e)
+
+init_db()
+
+# Configure HTTP session with retries
+session = requests.Session()
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=0.5,
+    status_forcelist=[429, 500, 502, 503, 504]
+)
+adapter = HTTPAdapter(max_retries=retry_strategy)
+session.mount("https://", adapter)
+
+API_KEY = "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"
+MODEL_NAME = "llama-3.3-70b-versatile"
+GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
+
+def call_groq_api(text: str, prompt_type: str) -> str:
+    """Call Groq API with optimized prompts for expense processing."""
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    
+    prompts = {
+        "normalize": {
+            "system": (
+                "Normalize expense descriptions to 'Item - Amount' format. "
+                "Correct typos, expand abbreviations. Return ONLY the normalized text."
+            ),
+            "user": f"Input: '{text}'\nNormalized:"
+        },
+        "extract_category": {
+            "system": (
+                "Extract SPECIFIC purchase category as ONE lowercase word. "
+                "Prioritize specific items (e.g., 'cappuccino', 'birthday_cake'). "
+                "Use underscores for multi-word categories."
+            ),
+            "user": f"Extract category from: '{text}'\nCategory:"
+        }
+    }
+    
+    try:
+        response = session.post(
+            GROQ_ENDPOINT,
+            json={
+                "model": MODEL_NAME,
+                "messages": [
+                    {"role": "system", "content": prompts[prompt_type]["system"]},
+                    {"role": "user", "content": prompts[prompt_type]["user"]}
+                ],
+                "temperature": 0.2,
+                "max_tokens": 30
+            },
+            headers=headers,
+            timeout=10
+        )
+        response.raise_for_status()
+        raw_output = response.json()["choices"][0]["message"]["content"].strip()
+        
+        if prompt_type == "extract_category":
+            # Process category output
+            category = re.sub(r"\W+", "_", raw_output.lower().split()[0])
+            return category[:20]  # Limit category length
+            
+        # Process normalization output
+        return re.sub(r'["\n].*', "", raw_output).strip()
+
+    except Exception as e:
+        logger.error("Groq API error: %s", str(e))
+        return text
+
+class ActionAddExpense(Action):
+    def name(self) -> Text:
+        return "action_add_expense"
+    
+    def run(self, dispatcher: CollectingDispatcher,
+            tracker: Tracker,
+            domain: Dict[Text, Any]) -> List[Dict[Text, Any]]:
+        
+        user_message = tracker.latest_message.get('text', '')
+        logger.info("Processing: %s", user_message)
+        
+        try:
+            normalized = call_groq_api(user_message, "normalize")
+            segments = re.split(r"\s*[+,&]\s+|\s+and\s+", normalized, flags=re.IGNORECASE)
+            success_count = 0
+            
+            for seg in segments:
+                seg = seg.strip()
+                if not seg:
+                    continue
+                
+                # Enhanced amount parsing
+                amount_match = re.search(
+                    r"(?:₹|\$|rs?\.?\s?|rupees?\s?)(\d+\.?\d{0,2})"
+                    r"|(\d+\.?\d{0,2})\s?(?:₹|\$|rs?|rupees?)"
+                    r"|(\d+\.?\d{1,2})\b(?!\s*\%)(?=\s|$)",
+                    seg,
+                    re.IGNORECASE
+                )
+                
+                if not amount_match:
+                    continue
+                
+                try:
+                    amount_str = next((g for g in amount_match.groups() if g), None)
+                    amount = round(float(amount_str), 2)
+                    description = re.sub(r"\b(?:₹|\$|rs?|rupees?)\b", "", seg, flags=re.IGNORECASE).strip()
+                    category = call_groq_api(description, "extract_category") or "other"
+                    
+                    with sqlite3.connect(DATABASE) as conn:
+                        conn.execute("""
+                            INSERT INTO expenses (description, amount, base_category, date)
+                            VALUES (?, ?, ?, ?)
+                        """, (
+                            description[:50],
+                            amount,
+                            category,
+                            datetime.date.today().isoformat()
+                        ))
+                    success_count += 1
+                    logger.info("Recorded: %s - ₹%s (%s)", description, amount, category)
+                    
+                except Exception as e:
+                    logger.error("Processing error: %s", str(e))
+            
+            if success_count > 0:
+                dispatcher.utter_message(f"✅ Added {success_count} expense(s)")
+            else:
+                dispatcher.utter_message("❌ Couldn't find amounts in: 'Item ₹Amount' format")
+                
+        except Exception as e:
+            logger.error("General error: %s", str(e))
+            dispatcher.utter_message("⚠️ Error processing request. Try again.")
+        
+        return []
+
+class ActionQueryExpense(Action):
+    def name(self) -> Text:
+        return "action_query_expense"
+    
+    def run(self, dispatcher: CollectingDispatcher,
+            tracker: Tracker,
+            domain: Dict[Text, Any]) -> List[Dict[Text, Any]]:
+        
+        try:
+            query_text = tracker.latest_message.get('text', '')
+            category = call_groq_api(query_text, "extract_category")
+            
+            with sqlite3.connect(DATABASE) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                
+                cursor.execute("""
+                    SELECT 
+                        SUM(amount) as total,
+                        GROUP_CONCAT(description || ' (₹' || amount || ')', ', ') as items
+                    FROM expenses 
+                    WHERE base_category = ?
+                """, (category,))
+                
+                result = cursor.fetchone()
+                total = result["total"] or 0
+                items = result["items"] or "No items found"
+                
+                if total > 0:
+                    response = (
+                        f"📊 {category.replace('_', ' ').title()} Spending\n"
+                        f"Total: ₹{total:.2f}\n"
+                        f"Recent purchases:\n- " + "\n- ".join(items.split(", "))
+                    )
+                else:
+                    response = f"📭 No expenses found for {category.replace('_', ' ')}"
+                
+                dispatcher.utter_message(response)
+                logger.info("Query success for category: %s", category)
+        
+        except Exception as e:
+            logger.error("Query error: %s", str(e))
+            dispatcher.utter_message("🔍 Couldn't retrieve expenses. Try again.")
+        
+        return []
