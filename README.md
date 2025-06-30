@@ -3,6 +3,20 @@
 ## Overview
 This is a WhatsApp Expense Tracker chatbot built using Rasa that allows users to record and query their expenses efficiently. The bot uses NLP techniques, a database for expense storage, and integrates with Twilio for WhatsApp messaging.
 
+---
+
+## 🎥 Demo
+
+<div align="center">
+  <video src="assets/demo.mp4" controls autoplay loop muted width="600">
+    Your browser does not support the video tag.
+  </video>
+</div>
+
+
+
+---
+
 ## Features
 📌 **Expense Recording**: Users can log their expenses with categories, amounts, and descriptions.  
 🏷 **Category Classification**: Uses NLP (Zero-shot learning & NER) to categorize expenses.  
